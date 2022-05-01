@@ -2,14 +2,74 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"io"
 	"log"
-	"math/rand"
 	"net"
 	"strings"
-	"time"
+	"sync"
 
+	"github.com/h12w/go-socks5"
 	"github.com/ishidawataru/sctp"
 )
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+func forwardConnect(backend, frontend net.Conn) {
+	done := make(chan struct{}, 2)
+
+	go bridge(backend, frontend, done)
+	go bridge(frontend, backend, done)
+
+	<-done
+}
+
+func bridge(src io.Reader, dst io.Writer, done chan struct{}) {
+	defer func() {
+		done <- struct{}{}
+	}()
+
+	buf := bufPool.Get().(*[]byte)
+	n, err := io.CopyBuffer(dst, src, *buf)
+	if err != nil {
+		fmt.Printf("have put %d Byte", n)
+		fmt.Println(err)
+	}
+	bufPool.Put(buf)
+}
+
+type MySCTP struct {
+	info *sctp.SndRcvInfo
+	*sctp.SCTPConn
+}
+
+func (c *MySCTP) Read(b []byte) (n int, err error) {
+	n, _, err = c.SCTPConn.SCTPRead(b)
+	return n, err
+}
+
+func (c *MySCTP) Write(b []byte) (n int, err error) {
+	n, err = c.SCTPConn.SCTPWrite(b, c.info)
+	return n, err
+}
+
+func NewMySCTP(s *sctp.SCTPConn) *MySCTP {
+	ppid := 0
+	s.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO)
+	info := &sctp.SndRcvInfo{
+		Stream: uint16(ppid),
+		PPID:   uint32(ppid),
+	}
+	return &MySCTP{
+		info,
+		s,
+	}
+}
 
 func serveClient(conn net.Conn, bufsize int) error {
 	for {
@@ -34,9 +94,8 @@ func main() {
 	var ip = flag.String("ip", "0.0.0.0", "")
 	var port = flag.Int("port", 0, "")
 	var lport = flag.Int("lport", 0, "")
-	var bufsize = flag.Int("bufsize", 256, "")
-	var sndbuf = flag.Int("sndbuf", 0, "")
-	var rcvbuf = flag.Int("rcvbuf", 0, "")
+	var sndbuf = flag.Int("sndbuf", 2048, "")
+	var rcvbuf = flag.Int("rcvbuf", 2048, "")
 
 	flag.Parse()
 
@@ -92,8 +151,9 @@ func main() {
 				log.Fatalf("failed to get read buf: %v", err)
 			}
 			log.Printf("SndBufSize: %d, RcvBufSize: %d", *sndbuf, *rcvbuf)
-
-			go serveClient(wconn, *bufsize)
+			conf := &socks5.Config{}
+			server, err := socks5.New(conf)
+			go server.ServeConn(wconn)
 		}
 
 	} else {
@@ -106,6 +166,17 @@ func main() {
 		conn, err := sctp.DialSCTP("sctp", laddr, addr)
 		if err != nil {
 			log.Fatalf("failed to dial: %v", err)
+		}
+		l, err := net.Listen("tcp", "127.0.0.1:1090")
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		sock, err := l.Accept()
+		if err != nil {
+			fmt.Println(err)
+			return
 		}
 
 		log.Printf("Dail LocalAddr: %s; RemoteAddr: %s", conn.LocalAddr(), conn.RemoteAddr())
@@ -133,30 +204,9 @@ func main() {
 		}
 		log.Printf("SndBufSize: %d, RcvBufSize: %d", *sndbuf, *rcvbuf)
 
-		ppid := 0
-		for {
-			info := &sctp.SndRcvInfo{
-				Stream: uint16(ppid),
-				PPID:   uint32(ppid),
-			}
-			ppid += 1
-			conn.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO)
-			buf := make([]byte, *bufsize)
-			n, err := rand.Read(buf)
-			if n != *bufsize {
-				log.Fatalf("failed to generate random string len: %d", *bufsize)
-			}
-			n, err = conn.SCTPWrite(buf, info)
-			if err != nil {
-				log.Fatalf("failed to write: %v", err)
-			}
-			log.Printf("write: len %d", n)
-			n, info, err = conn.SCTPRead(buf)
-			if err != nil {
-				log.Fatalf("failed to read: %v", err)
-			}
-			log.Printf("read: len %d, info: %+v", n, info)
-			time.Sleep(time.Second)
-		}
+		mySCTP := NewMySCTP(conn)
+		defer mySCTP.Close()
+		// buf := make([]byte, *bufsize)
+		go forwardConnect(mySCTP, sock)
 	}
 }
